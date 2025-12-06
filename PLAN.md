@@ -5,7 +5,7 @@ Use the sections below as a living checklist to guide discussion, coding, review
 ---
 
 ## 1. Core Tree & Gist Infrastructure
-- [ ] Confirm `GistNet` spec (inputs, cross-attn, span embeddings).
+- [x] Confirm `GistNet` spec (Gaussian RoPE-only inputs, per-LOD sigma, fixed-span cross-attn).
 - [ ] Implement `GistNet` module with unit tests.
 - [ ] Design `Node` data model + `build_lod_tree()` flow.
 - [ ] Implement tree builder + span math sanity tests.
@@ -15,7 +15,7 @@ Use the sections below as a living checklist to guide discussion, coding, review
 - [ ] Implement `tree_dropout` with unit tests for invariants.
 
 ## 2. Positional Encoding & Transformer Integration
-- [ ] Finalize Gaussian 2D RoPE spec/simplifications.
+- [x] Finalize Gaussian 2D RoPE spec/simplifications.
 - [ ] Implement `gaussian_rope` helper + tests for norm preservation.
 - [ ] Draft MegaContext-aware transformer wrapper (model inputs/outputs).
 - [ ] Integrate Gaussian RoPE, level embeddings, metadata plumbing.
