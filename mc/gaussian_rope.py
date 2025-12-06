@@ -106,10 +106,10 @@ class GaussianRoPE(nn.Module):
         """Apply standard RoPE rotation to a chunk [N, H, chunk_dim]."""
         N, H, chunk_dim = chunk.shape
         chunk = chunk.view(N, H, chunk_dim // 2, 2)  # [N, H, pairs, 2]
-        cos = angles.cos().to(chunk.dtype).unsqueeze(1).unsqueeze(-1)
-        sin = angles.sin().to(chunk.dtype).unsqueeze(1).unsqueeze(-1)
-        x1 = chunk[..., 0]
-        x2 = chunk[..., 1]
+        cos = angles.cos().to(chunk.dtype).unsqueeze(1)  # [N,1,pairs]
+        sin = angles.sin().to(chunk.dtype).unsqueeze(1)  # [N,1,pairs]
+        x1 = chunk[..., 0]  # [N,H,pairs]
+        x2 = chunk[..., 1]  # [N,H,pairs]
         out0 = x1 * cos - x2 * sin
         out1 = x1 * sin + x2 * cos
         return torch.stack((out0, out1), dim=-1).view(N, H, chunk_dim)
