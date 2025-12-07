@@ -64,6 +64,17 @@ def test_gistnet_forward_shape_and_gradients():
     assert torch.isfinite(children.grad).all()
 
 
+def test_gistnet_batches_multiple_spans_in_one_call() -> None:
+    torch.manual_seed(0)
+    net = GistNet(
+        d_model=16, n_head=4, n_kv_head=2, sigma_level=1.0, block_size=2
+    )
+    children = torch.randn(3, 2, 16)
+
+    output = net(children)
+    assert output.shape == (3, 16)
+
+
 def test_gistnet_attention_weights_sum_to_one():
     torch.manual_seed(1)
     net = GistNet(

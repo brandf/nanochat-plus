@@ -11,6 +11,7 @@ Use the sections below as a living checklist to guide discussion, coding, review
 - [ ] Expose `MegaContextTree` outputs to upcoming `lod_tree`/flattening utilities.
 - [ ] Design `Node` data model + `build_lod_tree()` flow.
 - [ ] Implement tree builder + span math sanity tests.
+- [ ] Add shared helpers to derive `(mu, sigma)` / span centers from `(level, node_index)` so downstream Gaussian RoPE + WC tooling never need bespoke metadata.
 - [ ] Define flattening order rules and metadata needed downstream.
 - [ ] Implement `tree_flatten` and validate children-before-parent ordering.
 - [ ] Specify dropout constraints + sampling approach.
@@ -33,7 +34,8 @@ Use the sections below as a living checklist to guide discussion, coding, review
 - [ ] Run initial end-to-end training sanity pass and capture findings.
 
 ## 4. WorkingContext Manager Foundations
-- [ ] Align on WC invariants + must-keep policy specifics.
+- [x] Align on WC invariants (ancestors must exist, leaf-only omission), WCT operating modes (`tree_causal_ordering`, `fully_virtual`), and batching requirements.
+- [x] Implement `WorkingContextTree` flattened view + metadata tensors + tests.
 - [ ] Implement `WCNode`, `WCState` utilities + tests.
 - [ ] Implement `FocusScorer` using attention maps (EMA, tail queries).
 - [ ] Draft `ContextManager` expand/collapse policy (heuristics only).

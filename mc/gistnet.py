@@ -49,28 +49,34 @@ class CrossAttentionBlock(nn.Module):
         """
         Args:
             query: [B, d_model]
-            children: [G, d_model]
+            children: [B, G, d_model] or [G, d_model]
         Returns:
             Tensor of shape [B, d_model]
         """
-        if children.ndim != 2:
-            raise ValueError("children must be a 2D tensor [G, d_model].")
+        if query.ndim == 1:
+            query = query.unsqueeze(0)
         if query.ndim != 2:
-            raise ValueError("query must be a 2D tensor [B, d_model].")
-        if children.shape[0] == 0:
-            raise ValueError("GistNet requires at least one child latent.")
+            raise ValueError("query must be [B, d_model].")
 
-        B = query.shape[0]
-        G = children.shape[0]
+        if children.ndim == 2:
+            children = children.unsqueeze(0)
+        if children.ndim != 3:
+            raise ValueError("children must be [B, G, d_model] or [G, d_model].")
+        if children.shape[1] == 0:
+            raise ValueError("GistNet requires at least one child latent.")
+        if query.shape[0] != children.shape[0]:
+            raise ValueError("query and children batch sizes must match.")
+
+        B, G = query.shape[0], children.shape[1]
         query_norm = norm(query)  # [B, d_model]
-        children_norm = norm(children)  # [G, d_model]
+        children_norm = norm(children)  # [B, G, d_model]
 
         query_seq = query_norm.unsqueeze(1)  # [B, 1, d_model]
-        child_seq = children_norm.unsqueeze(0)  # [1, G, d_model]
+        child_seq = children_norm  # [B, G, d_model]
 
-        q = self.q_proj(query_seq).view(B, 1, self.n_head, self.head_dim)  # [B,1,H,D]
-        k = self.k_proj(child_seq).view(1, G, self.n_kv_head, self.head_dim)  # [1,G,Hkv,D]
-        v = self.v_proj(child_seq).view(1, G, self.n_kv_head, self.head_dim)  # [1,G,Hkv,D]
+        q = self.q_proj(query_seq).view(B, 1, self.n_head, self.head_dim)
+        k = self.k_proj(child_seq).view(B, G, self.n_kv_head, self.head_dim)
+        v = self.v_proj(child_seq).view(B, G, self.n_kv_head, self.head_dim)
 
         query_mu = torch.full(
             (B, 1), float(max(G - 1, 0)), dtype=torch.float32, device=query.device
@@ -78,23 +84,23 @@ class CrossAttentionBlock(nn.Module):
         query_sigma = torch.full_like(query_mu, self.sigma_level)
         child_mu = torch.arange(G, dtype=torch.float32, device=children.device).view(
             1, G
-        )
+        ).expand(B, G)
         child_sigma = torch.full_like(child_mu, self.sigma_level)
 
         q = self._rotate_queries(q, query_mu, query_sigma)  # [B,1,H,D]
-        k = self._rotate_keys(k, child_mu, child_sigma)  # [1,G,Hkv,D]
+        k = self._rotate_keys(k, child_mu, child_sigma)  # [B,G,Hkv,D]
 
         q = norm(q)  # [B,1,H,D]
-        k = norm(k)  # [1,G,Hkv,D]
+        k = norm(k)  # [B,G,Hkv,D]
 
         q = q.transpose(1, 2)  # [B,H,1,D]
-        k = k.transpose(1, 2)  # [1,Hkv,G,D]
-        v = v.transpose(1, 2)  # [1,Hkv,G,D]
+        k = k.permute(0, 2, 1, 3)  # [B,Hkv,G,D]
+        v = v.permute(0, 2, 1, 3)  # [B,Hkv,G,D]
 
         if self.n_head != self.n_kv_head:
             repeat = self.n_head // self.n_kv_head
-            k = k.repeat_interleave(repeat, dim=1)  # [1,H,G,D]
-            v = v.repeat_interleave(repeat, dim=1)  # [1,H,G,D]
+            k = k.repeat_interleave(repeat, dim=1)  # [B,H,G,D]
+            v = v.repeat_interleave(repeat, dim=1)  # [B,H,G,D]
 
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B,H,1,G]
         attn = scores.softmax(dim=-1)
@@ -108,6 +114,14 @@ class CrossAttentionBlock(nn.Module):
     def _rotate_queries(
         self, q: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor
     ) -> torch.Tensor:
+        """
+        Apply Gaussian RoPE to query tensor.
+
+        Args:
+            q: `[B, 1, n_head, d_head]`
+            mu: `[B, 1]`
+            sigma: `[B, 1]`
+        """
         q_rot, _ = self.gaussian_rope(q, None, mu, sigma)
         if q_rot is None:
             raise RuntimeError("GaussianRoPE returned None for query rotation.")
@@ -116,6 +130,14 @@ class CrossAttentionBlock(nn.Module):
     def _rotate_keys(
         self, k: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor
     ) -> torch.Tensor:
+        """
+        Apply Gaussian RoPE to key tensor.
+
+        Args:
+            k: `[B, G, n_kv_head, d_head]`
+            mu: `[B, G]`
+            sigma: `[B, G]`
+        """
         _, k_rot = self.gaussian_rope(None, k, mu, sigma)
         if k_rot is None:
             raise RuntimeError("GaussianRoPE returned None for key rotation.")
@@ -153,27 +175,31 @@ class GistNet(nn.Module):
     def forward(self, x_children: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x_children: [G, d_model] latents for a fixed-size span.
+            x_children: [G, d_model] or [B, G, d_model] latents for fixed-size spans.
         Returns:
-            Tensor of shape [d_model] representing the gist latent.
+            Tensor of shape [d_model] (if single block) or [B, d_model].
         """
-        if x_children.ndim != 2:
-            raise ValueError("x_children must have shape [G, d_model].")
-        if x_children.shape[0] == 0:
-            raise ValueError("x_children must contain at least one child latent.")
-        if x_children.shape[0] != self.block_size:
+        orig_ndim = x_children.ndim
+        if x_children.ndim == 2:
+            x_children = x_children.unsqueeze(0)
+        if x_children.ndim != 3:
+            raise ValueError("x_children must be [G, d_model] or [B, G, d_model].")
+        if x_children.shape[1] != self.block_size:
             raise ValueError(
                 f"GistNet expected {self.block_size} children, "
-                f"but received {x_children.shape[0]}."
+                f"but received {x_children.shape[1]}."
             )
 
-        query = self.query_token.unsqueeze(0).to(
+        B = x_children.shape[0]
+        query = self.query_token.unsqueeze(0).expand(B, -1).to(
             device=x_children.device, dtype=x_children.dtype
-        )  # [1, d_model]
-        attn_out = self.attn(query, x_children)  # [1, d_model]
-        x = query + attn_out  # [1, d_model]
-        x = x + self.mlp(norm(x))  # [1, d_model]
-        return x.squeeze(0)
+        )  # [B, d_model]
+        attn_out = self.attn(query, x_children)  # [B, d_model]
+        x = query + attn_out  # [B, d_model]
+        x = x + self.mlp(norm(x))  # [B, d_model]
+        if orig_ndim == 2:
+            return x.squeeze(0)
+        return x
 
     @property
     def last_attention_weights(self) -> Optional[torch.Tensor]:

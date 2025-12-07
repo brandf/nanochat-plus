@@ -6,7 +6,7 @@ import torch.nn as nn
 
 
 def _build_inv_freq(num_components: int, base: float) -> torch.Tensor:
-    """Matches nanochat's RoPE inv-freq construction."""
+    """Matches nanochat's RoPE inv-freq construction (returns `[num_components]`)."""
     idx = torch.arange(0, num_components, dtype=torch.float32)
     return 1.0 / (base ** (idx / max(num_components, 1)))
 
@@ -71,6 +71,14 @@ class GaussianRoPE(nn.Module):
     def _rotate_tensor(
         self, tensor: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor, *, name: str
     ) -> torch.Tensor:
+        """
+        Rotate a Q/K tensor.
+
+        Args:
+            tensor: `[B, T, H, d_head]`
+            mu: `[B, T]`
+            sigma: `[B, T]`
+        """
         if tensor.ndim != 4:
             raise ValueError(f"{name} must be a [B, T, H, d_head] tensor.")
         B, T, _, d_head = tensor.shape
@@ -103,7 +111,7 @@ class GaussianRoPE(nn.Module):
         return rotated.view(B, T, -1, self.d_head)
 
     def _match_frequencies(self, angles: torch.Tensor, target_pairs: int) -> torch.Tensor:
-        """Tile or trim frequency rows so they match the needed pair count."""
+        """Tile or trim frequency rows so they match the needed pair count `[*, target_pairs]`."""
         current = angles.shape[-1]
         if current == target_pairs:
             return angles
@@ -113,7 +121,7 @@ class GaussianRoPE(nn.Module):
         return angles[:, :target_pairs]
 
     def _apply_chunk(self, chunk: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
-        """Apply standard RoPE rotation to a chunk [N, H, chunk_dim]."""
+        """Apply standard RoPE rotation to a chunk `[N, H, chunk_dim]`."""
         N, H, chunk_dim = chunk.shape
         chunk = chunk.view(N, H, chunk_dim // 2, 2)  # [N, H, pairs, 2]
         cos = angles.cos().to(chunk.dtype).unsqueeze(1)  # [N,1,pairs]

@@ -42,7 +42,7 @@ class MegaContextTree:
         self.d_model = gistnet.d_model
 
         self.batch_size: Optional[int] = None
-        self._levels: List[torch.Tensor] = []
+        self._levels: List[torch.Tensor] = []  # level tensors, each [B, L_l, d_model]
 
         if initial_lod0 is not None:
             self.append_lod0(initial_lod0)
@@ -58,17 +58,17 @@ class MegaContextTree:
         chunk = self._normalize_batch_input(embeddings)
         if not self._levels:
             self._initialize_levels()
-        self._levels[0] = torch.cat([self._levels[0], chunk], dim=1)
+        self._levels[0] = torch.cat([self._levels[0], chunk], dim=1)  # [B, L0+N, d]
         self._propagate_updates()
 
     def level_latents(self, level: int) -> torch.Tensor:
-        """Return `[B, L, d_model]` tensor for the requested LOD."""
+        """Return the `[B, L_level, d_model]` tensor for the requested LOD."""
         self._require_initialized()
         self._ensure_level(level)
         return self._levels[level]
 
     def level_counts(self, level: int) -> torch.Tensor:
-        """Number of nodes per sequence at the requested LOD."""
+        """Return `[B]` tensor with the node count per sequence for the LOD."""
         batch = self._require_initialized()
         self._ensure_level(level)
         count = self._levels[level].shape[1]
@@ -82,7 +82,7 @@ class MegaContextTree:
     def padded_level(self, level: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
-            padded_latents: `[B, L, d_model]` dense tensor.
+            padded_latents: `[B, L_level, d_model]` dense tensor.
             counts: `[B]` tensor describing the true length per sequence.
         """
         self._require_initialized()
@@ -94,6 +94,14 @@ class MegaContextTree:
         return len(self._levels)
 
     def _normalize_batch_input(self, value: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize incoming LOD0 data to `[B, N, d_model]` and capture batch metadata.
+
+        Args:
+            value: `[B, N, d_model]` or `[N, d_model]` tensor.
+        Returns:
+            Tensor shaped `[B, N, d_model]` on the tree's device/dtype.
+        """
         tensor = value
         if tensor.ndim == 2:
             if self.batch_size not in (None, 1):
@@ -122,7 +130,7 @@ class MegaContextTree:
         while True:
             if self.max_lods is not None and level >= self.max_lods:
                 break
-            prev_nodes = self._levels[level - 1]
+            prev_nodes = self._levels[level - 1]  # [B, L_prev, d_model]
             target = prev_nodes.shape[1] // self.block_size
             if target == 0:
                 break
@@ -136,24 +144,25 @@ class MegaContextTree:
                         device=self.device,
                     )
                 )
-            cur_nodes = self._levels[level]
+            cur_nodes = self._levels[level]  # [B, L_cur, d_model]
             cur_len = cur_nodes.shape[1]
-            if cur_len == target:
+            new_parents = target - cur_len
+            if new_parents <= 0:
                 level += 1
                 continue
-            new_chunks: List[torch.Tensor] = []
-            while cur_len < target:
-                start = cur_len * self.block_size
-                end = start + self.block_size
-                block = prev_nodes[:, start:end, :]  # [B, G, d_model]
-                gists = torch.stack(
-                    [self.gistnet(block[b]) for b in range(batch)],
-                    dim=0,
-                ).unsqueeze(1)  # [B,1,d_model]
-                new_chunks.append(gists)
-                cur_len += 1
-            addition = torch.cat(new_chunks, dim=1)
-            self._levels[level] = torch.cat([cur_nodes, addition], dim=1)
+            blocks = prev_nodes[:, : target * self.block_size, :].contiguous()  # [B, target*block_size, d]
+            blocks = blocks.view(
+                batch, target, self.block_size, self.d_model
+            )  # [B, target, block_size, d]
+            new_blocks = blocks[:, cur_len:target, :, :]  # [B, new_parents, block_size, d]
+            flat_blocks = new_blocks.reshape(
+                batch * new_parents, self.block_size, self.d_model
+            )
+            gists = self.gistnet(flat_blocks)  # [batch*new_parents, d_model] or [d_model]
+            if flat_blocks.shape[0] == 1 and gists.ndim == 1:
+                gists = gists.unsqueeze(0)
+            gists = gists.view(batch, new_parents, self.d_model)
+            self._levels[level] = torch.cat([cur_nodes, gists], dim=1)
             level += 1
 
     def _ensure_level(self, level: int) -> None:
