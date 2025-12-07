@@ -29,8 +29,14 @@ class _SpyRoPE(nn.Module):
         return q, k
 
 
-def _make_identity_gistnet(d_model: int = 4) -> GistNet:
-    net = GistNet(d_model=d_model, n_head=1, n_kv_head=1, sigma_level=1.0)
+def _make_identity_gistnet(d_model: int = 4, block_size: int = 2) -> GistNet:
+    net = GistNet(
+        d_model=d_model,
+        n_head=1,
+        n_kv_head=1,
+        sigma_level=1.0,
+        block_size=block_size,
+    )
     with torch.no_grad():
         eye = torch.eye(d_model)
         net.attn.q_proj.weight.copy_(eye)
@@ -45,7 +51,9 @@ def _make_identity_gistnet(d_model: int = 4) -> GistNet:
 
 def test_gistnet_forward_shape_and_gradients():
     torch.manual_seed(0)
-    net = GistNet(d_model=32, n_head=4, n_kv_head=2, sigma_level=1.5)
+    net = GistNet(
+        d_model=32, n_head=4, n_kv_head=2, sigma_level=1.5, block_size=4
+    )
     children = torch.randn(4, 32, requires_grad=True)
 
     output = net(children)
@@ -58,7 +66,9 @@ def test_gistnet_forward_shape_and_gradients():
 
 def test_gistnet_attention_weights_sum_to_one():
     torch.manual_seed(1)
-    net = GistNet(d_model=48, n_head=6, n_kv_head=3, sigma_level=2.0)
+    net = GistNet(
+        d_model=48, n_head=6, n_kv_head=3, sigma_level=2.0, block_size=5
+    )
     children = torch.randn(5, 48)
 
     _ = net(children)
@@ -75,7 +85,9 @@ def test_gistnet_attention_weights_sum_to_one():
 
 
 def test_gistnet_rejects_empty_child_spans():
-    net = GistNet(d_model=16, n_head=2, n_kv_head=2, sigma_level=1.0)
+    net = GistNet(
+        d_model=16, n_head=2, n_kv_head=2, sigma_level=1.0, block_size=4
+    )
     with pytest.raises(ValueError):
         net(torch.empty(0, 16))
 
@@ -98,7 +110,9 @@ def test_gistnet_attention_prefers_similarity():
 
 def test_gistnet_passes_expected_mu_sigma_to_rope():
     spy = _SpyRoPE()
-    net = GistNet(d_model=8, n_head=2, n_kv_head=2, sigma_level=3.0)
+    net = GistNet(
+        d_model=8, n_head=2, n_kv_head=2, sigma_level=3.0, block_size=3
+    )
     net.attn.gaussian_rope = spy
     children = torch.randn(3, 8)
 
@@ -124,10 +138,14 @@ def test_gistnet_passes_expected_mu_sigma_to_rope():
 
 def test_gistnet_sigma_level_changes_output():
     torch.manual_seed(2)
-    base = GistNet(d_model=32, n_head=4, n_kv_head=2, sigma_level=1.0)
+    base = GistNet(
+        d_model=32, n_head=4, n_kv_head=2, sigma_level=1.0, block_size=4
+    )
     children = torch.randn(4, 32)
 
-    variant = GistNet(d_model=32, n_head=4, n_kv_head=2, sigma_level=4.0)
+    variant = GistNet(
+        d_model=32, n_head=4, n_kv_head=2, sigma_level=4.0, block_size=4
+    )
     variant.load_state_dict(copy.deepcopy(base.state_dict()))
 
     out_base = base(children)
@@ -140,7 +158,9 @@ def test_gistnet_sigma_level_changes_output():
     not hasattr(torch, "compile"), reason="torch.compile not available"
 )
 def test_gistnet_torch_compile_matches_eager():
-    net = GistNet(d_model=32, n_head=4, n_kv_head=2, sigma_level=1.0)
+    net = GistNet(
+        d_model=32, n_head=4, n_kv_head=2, sigma_level=1.0, block_size=4
+    )
     children = torch.randn(4, 32)
 
     compiled = torch.compile(net, backend="eager")
@@ -150,7 +170,9 @@ def test_gistnet_torch_compile_matches_eager():
 def test_gistnet_end_to_end_integration_on_toy_tree():
     """Build two LOD1 nodes with known children and verify gists match expectations."""
     torch.manual_seed(3)
-    net = GistNet(d_model=16, n_head=4, n_kv_head=2, sigma_level=1.0)
+    net = GistNet(
+        d_model=16, n_head=4, n_kv_head=2, sigma_level=1.0, block_size=4
+    )
     # span A children, span B children
     span_a = torch.randn(4, 16)
     span_b = torch.randn(4, 16)
@@ -166,7 +188,9 @@ def test_gistnet_end_to_end_integration_on_toy_tree():
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_gistnet_handles_multiple_dtypes(dtype):
-    net = GistNet(d_model=32, n_head=4, n_kv_head=2, sigma_level=1.0).to(dtype=dtype)
+    net = GistNet(
+        d_model=32, n_head=4, n_kv_head=2, sigma_level=1.0, block_size=6
+    ).to(dtype=dtype)
     children = torch.randn(6, 32, dtype=dtype)
 
     output = net(children)
@@ -175,7 +199,9 @@ def test_gistnet_handles_multiple_dtypes(dtype):
 
 def test_gistnet_supports_varied_head_ratios_and_span_sizes():
     torch.manual_seed(4)
-    net = GistNet(d_model=48, n_head=6, n_kv_head=3, sigma_level=1.0)
+    net = GistNet(
+        d_model=48, n_head=6, n_kv_head=3, sigma_level=1.0, block_size=8
+    )
     children = torch.randn(8, 48)
 
     _ = net(children)

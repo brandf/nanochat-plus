@@ -7,6 +7,8 @@ Use the sections below as a living checklist to guide discussion, coding, review
 ## 1. Core Tree & Gist Infrastructure
 - [x] Confirm `GistNet` spec (Gaussian RoPE-only inputs, per-LOD sigma, fixed-span cross-attn).
 - [x] Implement `GistNet` module with unit tests.
+- [x] Implement `MegaContextTree` owning block-aligned gist tensors (docs + tests).
+- [ ] Expose `MegaContextTree` outputs to upcoming `lod_tree`/flattening utilities.
 - [ ] Design `Node` data model + `build_lod_tree()` flow.
 - [ ] Implement tree builder + span math sanity tests.
 - [ ] Define flattening order rules and metadata needed downstream.

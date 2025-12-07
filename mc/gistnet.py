@@ -131,12 +131,16 @@ class GistNet(nn.Module):
         n_head: int,
         n_kv_head: int,
         sigma_level: float,
+        block_size: int,
     ) -> None:
         super().__init__()
         if sigma_level <= 0:
             raise ValueError("sigma_level must be positive.")
+        if block_size <= 0:
+            raise ValueError("block_size must be positive.")
         self.d_model = d_model
         self.sigma_level = float(sigma_level)
+        self.block_size = int(block_size)
         self.query_token = nn.Parameter(torch.randn(d_model))
         self.attn = CrossAttentionBlock(
             d_model=d_model,
@@ -157,6 +161,11 @@ class GistNet(nn.Module):
             raise ValueError("x_children must have shape [G, d_model].")
         if x_children.shape[0] == 0:
             raise ValueError("x_children must contain at least one child latent.")
+        if x_children.shape[0] != self.block_size:
+            raise ValueError(
+                f"GistNet expected {self.block_size} children, "
+                f"but received {x_children.shape[0]}."
+            )
 
         query = self.query_token.unsqueeze(0).to(
             device=x_children.device, dtype=x_children.dtype
