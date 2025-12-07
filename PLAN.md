@@ -39,6 +39,8 @@ Use the sections below as a living checklist to guide discussion, coding, review
 - [ ] Implement `WCNode`, `WCState` utilities + tests.
 - [ ] Implement `FocusScorer` using attention maps (EMA, tail queries).
 - [ ] Draft `ContextManager` expand/collapse policy (heuristics only).
+- [ ] Implement `TrainingContextManager` facade (batch ingest, full MCT build, WCT conversion, deterministic virtual sparsification + holdout mask, LensNet target plumbing).
+- [ ] Implement `InferenceContextManager` facade (persistent MCT/WCT, append/refocus loop, target window enforcement, seeded placeholder focus scoring that honors invariants).
 - [ ] Unit-test invariants and synthetic update sequences.
 - [ ] Review interplay between WC updates and MegaContext model outputs.
 
