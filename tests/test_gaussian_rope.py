@@ -167,3 +167,18 @@ def test_gaussian_rope_backpropagates_gradients():
     loss.backward()
     assert torch.isfinite(q.grad).all()
     assert torch.isfinite(k.grad).all()
+def test_gaussian_rope_supports_optional_q_or_k():
+    rope = GaussianRoPE(d_head=32)
+    q = torch.randn(1, 3, 2, 32)
+    k = torch.randn(1, 3, 2, 32)
+    mu = torch.arange(3, dtype=torch.float32).view(1, 3)
+    sigma = torch.full_like(mu, rope.sigma_base)
+
+    q_rot, k_rot = rope(q, None, mu, sigma)
+    assert q_rot is not None
+    assert q_rot.shape == q.shape
+    assert k_rot is None
+    q_rot2, k_rot2 = rope(None, k, mu, sigma)
+    assert q_rot2 is None
+    assert k_rot2 is not None
+    assert k_rot2.shape == k.shape

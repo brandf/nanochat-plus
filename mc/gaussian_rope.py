@@ -43,54 +43,64 @@ class GaussianRoPE(nn.Module):
 
     def forward(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
+        q: Optional[torch.Tensor],
+        k: Optional[torch.Tensor],
         mu: torch.Tensor,
         sigma: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Args:
-            q: [B, T, n_heads, d_head]
-            k: [B, T, n_kv_heads, d_head]
-            mu: [B, T] span centers (global or local)
-            sigma: [B, T] span sizes
+            q: optional [B, T, n_heads, d_head]
+            k: optional [B, T, n_kv_heads, d_head]
+            mu: [B, T] coordinates for provided tensor(s)
+            sigma: [B, T] span sizes for provided tensor(s)
         """
-        if q.ndim != 4 or k.ndim != 4:
-            raise ValueError("q and k must be [B, T, H, d_head] tensors.")
-        if q.shape[:2] != mu.shape or q.shape[:2] != sigma.shape:
-            raise ValueError("mu/sigma must match the [B, T] shape of q/k.")
-        if q.shape[-1] != self.d_head or k.shape[-1] != self.d_head:
+        if q is None and k is None:
+            raise ValueError("GaussianRoPE requires at least one of q or k.")
+        if mu is None or sigma is None:
+            raise ValueError("mu and sigma must be provided.")
+
+        q_rot: Optional[torch.Tensor] = None
+        k_rot: Optional[torch.Tensor] = None
+        if q is not None:
+            q_rot = self._rotate_tensor(q, mu, sigma, name="q")
+        if k is not None:
+            k_rot = self._rotate_tensor(k, mu, sigma, name="k")
+        return q_rot, k_rot
+
+    def _rotate_tensor(
+        self, tensor: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor, *, name: str
+    ) -> torch.Tensor:
+        if tensor.ndim != 4:
+            raise ValueError(f"{name} must be a [B, T, H, d_head] tensor.")
+        B, T, _, d_head = tensor.shape
+        if d_head != self.d_head:
             raise ValueError(
-                f"q/k last dim must equal configured d_head={self.d_head}."
+                f"{name} last dim must equal configured d_head={self.d_head}."
+            )
+        if mu.shape != (B, T) or sigma.shape != (B, T):
+            raise ValueError(
+                f"mu/sigma must match the first two dims of {name} (got {mu.shape}, {sigma.shape})."
             )
 
-        B, T, n_heads, _ = q.shape
-        _, _, n_kv_heads, _ = k.shape
-        q_flat = q.reshape(B * T, n_heads, self.d_head)  # [N, H, d_head]
-        k_flat = k.reshape(B * T, n_kv_heads, self.d_head)  # [N, H_kv, d_head]
-        mu_flat = mu.to(q.dtype).reshape(B * T)  # [N]
-        sigma_flat = sigma.to(q.dtype).reshape(B * T)  # [N]
-        sigma_flat = torch.clamp(sigma_flat, min=1e-8)
+        tensor_flat = tensor.reshape(B * T, -1, self.d_head)  # [N, H, d_head]
+        mu_flat = mu.to(tensor.dtype).reshape(B * T)  # [N]
+        sigma_flat = torch.clamp(sigma.to(tensor.dtype), min=1e-8).reshape(B * T)
         log_sigma = torch.log2(sigma_flat / self.sigma_base)
 
+        device = tensor_flat.device
         time_angles = self._match_frequencies(
-            mu_flat[:, None] * self.time_inv_freq.to(q_flat.device), self.pair_dim
-        )  # [N, pair_dim]
+            mu_flat[:, None] * self.time_inv_freq.to(device), self.pair_dim
+        )
         scale_angles = self._match_frequencies(
-            log_sigma[:, None] * self.scale_inv_freq.to(q_flat.device), self.pair_dim
-        )  # [N, pair_dim]
+            log_sigma[:, None] * self.scale_inv_freq.to(device), self.pair_dim
+        )
 
-        q_time, q_scale = torch.split(q_flat, self.chunk_dim, dim=-1)
-        k_time, k_scale = torch.split(k_flat, self.chunk_dim, dim=-1)
-        q_time = self._apply_chunk(q_time, time_angles)
-        k_time = self._apply_chunk(k_time, time_angles)
-        q_scale = self._apply_chunk(q_scale, scale_angles)
-        k_scale = self._apply_chunk(k_scale, scale_angles)
-        q_flat = torch.cat([q_time, q_scale], dim=-1)
-        k_flat = torch.cat([k_time, k_scale], dim=-1)
-        q_rot = q_flat.view(B, T, n_heads, self.d_head)
-        k_rot = k_flat.view(B, T, n_kv_heads, self.d_head)
-        return q_rot, k_rot
+        time_chunk, scale_chunk = torch.split(tensor_flat, self.chunk_dim, dim=-1)
+        time_chunk = self._apply_chunk(time_chunk, time_angles)
+        scale_chunk = self._apply_chunk(scale_chunk, scale_angles)
+        rotated = torch.cat([time_chunk, scale_chunk], dim=-1)
+        return rotated.view(B, T, -1, self.d_head)
 
     def _match_frequencies(self, angles: torch.Tensor, target_pairs: int) -> torch.Tensor:
         """Tile or trim frequency rows so they match the needed pair count."""
