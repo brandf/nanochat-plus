@@ -43,9 +43,6 @@ class WorkingContextTree:
         self.flags: Optional[torch.Tensor] = None
         self.lengths: Optional[torch.Tensor] = None
 
-        self.tree_causal_ordering = True
-        self.fully_virtual = True  # remains True until nodes are physically omitted
-
     # --------------------------------------------------------------------- APIs
     def append_nodes(
         self,
@@ -110,8 +107,76 @@ class WorkingContextTree:
             self.flags[b, start:end] = flag_values[b]  # [K]
             self.lengths[b] = end
 
-        self.tree_causal_ordering = False
-        # fully_virtual remains unchanged until omissions occur
+    def load_sequence(
+        self,
+        *,
+        latents: torch.Tensor,  # [B, N, d_model]
+        node_levels: torch.Tensor,  # [B, N]
+        node_indices: torch.Tensor,  # [B, N]
+        flags: Optional[torch.Tensor] = None,  # [B, N]
+        lengths: Optional[torch.Tensor] = None,  # [B]
+    ) -> None:
+        """
+        Overwrite the WorkingContextTree with a fully formed sequence. This path is
+        used by the TrainingContextManager to mirror the entire MegaContextTree in a
+        single fused write, avoiding Python-side loops that break torch.compile.
+
+        Args:
+            latents: `[B, N, d_model]` tensor containing the flattened nodes.
+            node_levels / node_indices: `[B, N]` tensors describing metadata.
+            flags: optional `[B, N]` tensor of WCTFlags.
+            lengths: optional `[B]` tensor of valid sequence lengths. When omitted,
+                every batch entry uses `N`.
+        """
+        if latents.ndim != 3:
+            raise ValueError("latents must have shape [B, N, d_model].")
+        if node_levels.shape != latents.shape[:2]:
+            raise ValueError("node_levels must have shape [B, N].")
+        if node_indices.shape != latents.shape[:2]:
+            raise ValueError("node_indices must have shape [B, N].")
+        if flags is not None and flags.shape != latents.shape[:2]:
+            raise ValueError("flags must have shape [B, N].")
+
+        B, N, d_model = latents.shape
+        if lengths is None:
+            lengths = torch.full(
+                (B,),
+                N,
+                dtype=torch.long,
+                device=latents.device,
+            )
+        else:
+            if lengths.shape != (B,):
+                raise ValueError("lengths must have shape [B].")
+            lengths = lengths.to(device=latents.device, dtype=torch.long)
+        if torch.any(lengths > N):
+            raise ValueError("lengths entries cannot exceed the provided sequence.")
+        if N > self.max_nodes:
+            raise ValueError("Provided sequence exceeds WorkingContextTree capacity.")
+
+        self._ensure_storage_initialized(B, d_model, template=latents)
+        assert self.latents is not None
+        assert self.node_ids is not None
+        assert self.flags is not None
+        assert self.lengths is not None
+
+        max_len = N
+        self.latents[:, :max_len] = latents.to(
+            device=self.latents.device, dtype=self.latents.dtype
+        )
+        self.node_ids[:, :max_len, 0] = node_levels.to(
+            device=self.node_ids.device, dtype=torch.long
+        )
+        self.node_ids[:, :max_len, 1] = node_indices.to(
+            device=self.node_ids.device, dtype=torch.long
+        )
+        if flags is None:
+            self.flags[:, :max_len] = int(WCTFlags.NONE)
+        else:
+            self.flags[:, :max_len] = flags.to(
+                device=self.flags.device, dtype=torch.long
+            )
+        self.lengths = lengths.to(device=self.lengths.device)
 
     def mark_virtual(self, mask: torch.Tensor) -> None:
         """
@@ -147,74 +212,14 @@ class WorkingContextTree:
             slice_mask = mask[b, :length]
             self.flags[b, :length][slice_mask] &= ~flag_val
 
-    def omit_nodes(self, mask: torch.Tensor) -> None:
-        """
-        Physically remove nodes indicated by mask; compacts tensors.
+    def omit_nodes(self, mask: torch.Tensor) -> None:  # pragma: no cover
+        raise NotImplementedError("Physical omission is disabled in the fully-virtual mode.")
 
-        Args:
-            mask: `[B, max_nodes]` boolean tensor; True entries are removed.
-        """
-        mask = self._normalize_mask(mask)
-        self._require_storage_ready()
-        assert self.latents is not None and self.node_ids is not None
-        assert self.flags is not None and self.lengths is not None
-        for b in range(self.batch_size):
-            length = int(self.lengths[b].item())
-            if length == 0:
-                continue
-            keep = ~mask[b, :length]
-            idx = torch.nonzero(keep, as_tuple=False).flatten()
-            new_len = idx.numel()
-            if new_len == length:
-                continue
-            if new_len > 0:
-                self.latents[b, :new_len] = self.latents[b, idx]
-                self.node_ids[b, :new_len] = self.node_ids[b, idx]
-                self.flags[b, :new_len] = self.flags[b, idx]
-            self.lengths[b] = new_len
-        self.fully_virtual = False
+    def compact_virtual(self) -> None:  # pragma: no cover
+        raise NotImplementedError("Physical compaction is disabled in the fully-virtual mode.")
 
-    def compact_virtual(self) -> None:
-        """Drop virtual nodes (flagged with bit 0) and compact the tensors."""
-        virtual_bit = int(WCTFlags.VIRTUAL)
-        self._require_storage_ready()
-        assert self.latents is not None and self.node_ids is not None
-        assert self.flags is not None and self.lengths is not None
-        for b in range(self.batch_size):
-            length = int(self.lengths[b].item())
-            if length == 0:
-                continue
-            keep = (self.flags[b, :length] & virtual_bit) == 0
-            idx = torch.nonzero(keep, as_tuple=False).flatten()
-            new_len = idx.numel()
-            if new_len == length:
-                continue
-            if new_len > 0:
-                self.latents[b, :new_len] = self.latents[b, idx]
-                self.node_ids[b, :new_len] = self.node_ids[b, idx]
-                self.flags[b, :new_len] = self.flags[b, idx]
-            self.lengths[b] = new_len
-        self.fully_virtual = False
-
-    def rebuild_causal_order(self, permutation: torch.Tensor) -> None:
-        """
-        Reorder nodes per provided permutation.
-
-        Args:
-            permutation: `[B, max_nodes]` integer tensor describing the new slot order.
-                Only the first `lengths[b]` entries are honored for each batch.
-        """
-        perm = self._normalize_permutation(permutation)
-        self._require_storage_ready()
-        for b in range(self.batch_size):
-            length = int(self.lengths[b].item())
-            if length == 0:
-                continue
-            order = perm[b, :length]
-            self.latents[b, :length] = self.latents[b, order]
-            self.node_ids[b, :length] = self.node_ids[b, order]
-            self.flags[b, :length] = self.flags[b, order]
-        self.tree_causal_ordering = True
+    def rebuild_causal_order(self, permutation: torch.Tensor) -> None:  # pragma: no cover
+        raise NotImplementedError("Reordering is unnecessary in the fully-virtual mode.")
 
     # ----------------------------------------------------------------- helpers
     def tensors(
@@ -275,18 +280,6 @@ class WorkingContextTree:
         if mask.shape != (self.batch_size, self.max_nodes):
             raise ValueError("mask must have shape [B, max_nodes].")
         return mask
-
-    def _normalize_permutation(self, perm: torch.Tensor) -> torch.Tensor:
-        """Ensure permutation tensor is `[B, max_nodes]` with valid ranges."""
-        if self.batch_size is None:
-            raise RuntimeError("WorkingContextTree has not received any nodes yet.")
-        if perm.shape != (self.batch_size, self.max_nodes):
-            raise ValueError("permutation must have shape [B, max_nodes].")
-        if perm.dtype != torch.long:
-            raise ValueError("permutation must be integer.")
-        if torch.any(perm < 0) or torch.any(perm >= self.max_nodes):
-            raise ValueError("permutation entries must be within [0, max_nodes).")
-        return perm
 
     def _ensure_storage_initialized(
         self, batch_size: int, d_model: int, template: torch.Tensor
