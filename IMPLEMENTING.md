@@ -1,44 +1,45 @@
-# IMPLEMENTING – GUIDELINES & BEST PRACTICES
+# IMPLEMENTING - GUIDELINES & BEST PRACTICES
 
-Use this checklist whenever you touch the codebase. It keeps new features aligned with nanochat style, fast, and easy to maintain.
+Use this checklist whenever you touch the shared codebase. It keeps new features aligned with nanochat style, fast, and easy to maintain across experiments.
 
 ---
 
 ## 1. Design Principles
-- **Reuse nanochat patterns:** when adding MegaContext modules, mirror existing nanochat APIs, tensor layouts, and coding style. Favor small, modular helpers.
-- **Keep it simple:** avoid unnecessary abstractions. Clear, readable code is easier to compile, optimize, and debug.
-- **GPU-friendly data flows:** store metadata (positions, levels, etc.) in tensors whenever possible. Minimize Python objects or per-node data structures that break batching.
+- **Reuse nanochat patterns:** mirror existing APIs, tensor layouts, and naming. Favor small, modular helpers that slot into `nanochat/` or `scripts/` without surprise.
+- **Keep it simple:** lean on clear control flow and direct tensor ops; avoid speculative abstractions.
+- **GPU-friendly data flows:** store metadata in tensors when possible, minimize Python-side per-token work, and preserve batching.
+- **Branch-portable code:** avoid sprinkling experiment-specific assumptions into shared helpers. Gate custom logic behind explicit configuration objects.
 
 ---
 
 ## 2. Performance Essentials
-- **torch.compile everywhere:** plan algorithms so they work with `torch.compile` (no dynamic graph captures, no Python-side control flow that changes shapes). Enable it by default in new modules.
-- **Static shapes when possible:** preallocate buffers, avoid shape-dependent branches during forward passes, and use Boolean masks instead of Python loops for per-element decisions.
-- **Efficient data types:** follow nanochat’s defaults—BF16 for activations/embeddings on GPUs, FP32 where precision is required (e.g., logits before softmax). Downgrade to FP16 only if the baseline nanochat model already does so or benchmarks show clear gains.
-- **Memory-aware code:** prefer in-place operations (when safe), share buffers, and rely on contiguous tensors. Keep intermediate tensors lean to prevent slowdowns in forward/backward passes.
+- **torch.compile ready:** structure code so it works under `torch.compile` (stable shapes, no hidden stateful globals, avoid Python-side shape switching).
+- **Static-ish shapes:** preallocate buffers, avoid per-step tensor reallocations, and use masks instead of Python loops for element-wise filtering.
+- **Efficient dtypes:** follow nanochat defaults (BF16 activations/embeddings on GPU, FP32 for numerically sensitive paths). Only downgrade if we already benchmarked the baseline.
+- **Memory awareness:** reuse buffers, favor inplace ops when safe, and keep intermediate tensors lean to support long sequences.
 
 ---
 
 ## 3. Tensor Documentation
-- **Inline shape comments:** append `# [B, T, d]`-style comments to every non-trivial tensor assignment so reviewers immediately see dimensionality.
-- **Consistent naming:** use `mu`, `sigma`, `level`, `latent`, `node_ids`, etc., consistently across modules to avoid confusion.
+- **Inline shape comments:** append `# [B, T, d]` style notes to non-trivial tensor assignments.
+- **Consistent naming:** reuse canonical names like `tokens`, `positions`, `mu`, `sigma`, `levels`, `cache`, `logits` so components compose cleanly.
 
 ---
 
 ## 4. Testing & Validation
-- **Unit + integration tests:** follow `TESTING.md` requirements—write focused unit tests for each helper (e.g., Gaussian RoPE) and integration tests for multi-module flows.
-- **CPU-friendly test configs:** shrink dimensions/sequence lengths for tests so they run quickly on CPUs without CUDA.
-- **Run tests every time:** before finishing any task, run the relevant `pytest` targets locally and ensure they pass.
+- **Unit + integration:** follow `TESTING.md` to decide which suites must be updated. Every helper touched gets corresponding tests.
+- **CPU-friendly configs:** shrink dimensions/sequence lengths for tests so they run in seconds.
+- **Run tests every time:** execute the relevant `pytest` targets before handing off a change; capture the command in commit or PR notes when helpful.
 
 ---
 
 ## 5. Collaboration Protocol
-- **Ask when unclear:** if requirements are ambiguous, pause and confirm with the human rather than guessing.
-- **Otherwise act independently:** once requirements are clear, implement, test, and iterate without waiting for extra prompts.
-- **Document assumptions:** note design choices (e.g., head splits, precision tweaks) in code comments or PR summaries so others know the rationale.
-- **Self-review before handoff:** re-read your diffs and the touched files end-to-end to ensure they honor these guidelines (naming, shape comments, tensor usage) and don’t leave “turd” leftovers for others to discover.
-- **No silent deviations:** Never execute an implementation strategy that differs from explicit instructions without asking first. If a request seems infeasible or unclear, pause and confirm rather than improvising.
+- **Ask when unclear:** clarify ambiguous requirements or cross-branch impacts early.
+- **Act independently otherwise:** once aligned, implement, self-review, and iterate without waiting for further prompts.
+- **Document assumptions:** add short comments or commit notes when taking non-obvious paths (precision tweaks, cache eviction rules, etc.).
+- **Self-review before handoff:** read your diffs end-to-end to ensure naming, shapes, and style match these guidelines.
+- **No silent deviations:** if you must diverge from these rules, note it explicitly and explain why.
 
 ---
 
-Following these guidelines keeps MegaContext development fast (“training goes brrr”), reliable, and aligned with nanochat’s minimal style.
+Following these guidelines keeps nanochat-plus development fast ("training goes brrr"), reliable, and ready for whatever experiment branches build on top.
