@@ -8,7 +8,7 @@ import torch
 
 class WCTFlags(IntFlag):
     NONE = 0
-    VIRTUAL = 1 << 0
+    MASKED = 1 << 0
 
 
 class WorkingContextTree:
@@ -17,7 +17,7 @@ class WorkingContextTree:
 
     Latents live in `[B, max_nodes, d_model]` tensors. Metadata is tracked in tensors:
       - `node_ids`: `[B, max_nodes, 2]` integers storing `(level, node_index)`
-      - `flags`: `[B, max_nodes]` bitmasks describing per-node status (virtual, pinned, etc.)
+      - `flags`: `[B, max_nodes]` bitmasks describing per-node status (masked, pinned, etc.)
     Partial sequences are denoted via `lengths` per batch entry; positional info is derived
     from `node_ids` when downstream modules need `(mu, sigma)`.
     """
@@ -178,16 +178,16 @@ class WorkingContextTree:
             )
         self.lengths = lengths.to(device=self.lengths.device)
 
-    def mark_virtual(self, mask: torch.Tensor) -> None:
+    def mark_masked(self, mask: torch.Tensor) -> None:
         """
-        Mark nodes as virtually removed.
+        Mark nodes as masked (logically removed but kept in-place).
 
         Args:
-            mask: `[B, max_nodes]` boolean tensor; True entries toggle the VIRTUAL bit.
+            mask: `[B, max_nodes]` boolean tensor; True entries toggle the MASKED bit.
         """
         mask = self._normalize_mask(mask)
         self._require_storage_ready()
-        flag_val = int(WCTFlags.VIRTUAL)
+        flag_val = int(WCTFlags.MASKED)
         for b in range(self.batch_size):
             length = int(self.lengths[b].item())
             if length == 0:
@@ -195,16 +195,16 @@ class WorkingContextTree:
             slice_mask = mask[b, :length]
             self.flags[b, :length][slice_mask] |= flag_val
 
-    def reinstate_virtual(self, mask: torch.Tensor) -> None:
+    def reinstate_masked(self, mask: torch.Tensor) -> None:
         """
-        Clear the virtual bit for nodes.
+        Clear the masked bit for nodes.
 
         Args:
             mask: `[B, max_nodes]` boolean tensor; True entries clear the bit.
         """
         mask = self._normalize_mask(mask)
         self._require_storage_ready()
-        flag_val = int(WCTFlags.VIRTUAL)
+        flag_val = int(WCTFlags.MASKED)
         for b in range(self.batch_size):
             length = int(self.lengths[b].item())
             if length == 0:
@@ -213,13 +213,13 @@ class WorkingContextTree:
             self.flags[b, :length][slice_mask] &= ~flag_val
 
     def omit_nodes(self, mask: torch.Tensor) -> None:  # pragma: no cover
-        raise NotImplementedError("Physical omission is disabled in the fully-virtual mode.")
+        raise NotImplementedError("Physical omission is disabled in the fully-masked mode.")
 
-    def compact_virtual(self) -> None:  # pragma: no cover
-        raise NotImplementedError("Physical compaction is disabled in the fully-virtual mode.")
+    def compact_masked(self) -> None:  # pragma: no cover
+        raise NotImplementedError("Physical compaction is disabled in the fully-masked mode.")
 
     def rebuild_causal_order(self, permutation: torch.Tensor) -> None:  # pragma: no cover
-        raise NotImplementedError("Reordering is unnecessary in the fully-virtual mode.")
+        raise NotImplementedError("Reordering is unnecessary in the fully-masked mode.")
 
     # ----------------------------------------------------------------- helpers
     def tensors(

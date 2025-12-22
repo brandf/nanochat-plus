@@ -69,7 +69,7 @@ def test_wct_append_with_flags_and_zero_nodes() -> None:
     latents = torch.zeros(2, 1, 4)
     levels = torch.zeros(2, 1, dtype=torch.long)
     idxs = torch.zeros(2, 1, dtype=torch.long)
-    flag_mask = torch.full((2, 1), fill_value=int(WCTFlags.VIRTUAL), dtype=torch.long)
+    flag_mask = torch.full((2, 1), fill_value=int(WCTFlags.MASKED), dtype=torch.long)
     wct.append_nodes(
         latents=latents,
         node_levels=levels,
@@ -78,7 +78,7 @@ def test_wct_append_with_flags_and_zero_nodes() -> None:
     )
     lat, _, flags, lengths = wct.tensors()
     assert torch.all(lat == 0)
-    assert torch.all(flags[:, 0] == int(WCTFlags.VIRTUAL))
+    assert torch.all(flags[:, 0] == int(WCTFlags.MASKED))
     assert lengths.tolist() == [1, 1]
 
     empty_latents = torch.zeros(2, 0, 4)
@@ -92,7 +92,7 @@ def test_wct_append_with_flags_and_zero_nodes() -> None:
     assert lengths_after.tolist() == lengths.tolist()
 
 
-def test_wct_mark_and_reinstate_virtual() -> None:
+def test_wct_mark_and_reinstate_masked() -> None:
     wct = _make_wct()
     latents = torch.zeros(2, 3, 4)
     levels = torch.zeros(2, 3, dtype=torch.long)
@@ -101,12 +101,12 @@ def test_wct_mark_and_reinstate_virtual() -> None:
 
     mask = torch.zeros(2, wct.max_nodes, dtype=torch.bool)
     mask[0, 1] = True
-    wct.mark_virtual(mask)
+    wct.mark_masked(mask)
     _, _, flags, lengths = wct.tensors()
-    assert flags[0, 1].item() & int(WCTFlags.VIRTUAL)
+    assert flags[0, 1].item() & int(WCTFlags.MASKED)
     assert lengths.tolist() == [3, 3]
 
-    wct.reinstate_virtual(mask)
+    wct.reinstate_masked(mask)
     _, _, flags, _ = wct.tensors()
     assert flags[0, 1].item() == int(WCTFlags.NONE)
 
@@ -120,7 +120,7 @@ def test_wct_mask_shape_validation() -> None:
 
     bad_mask = torch.zeros(1, wct.max_nodes, dtype=torch.bool)
     with pytest.raises(ValueError):
-        wct.mark_virtual(bad_mask)
+        wct.mark_masked(bad_mask)
 
 
 def test_wct_append_shape_validation() -> None:
@@ -152,7 +152,7 @@ def test_wct_load_sequence_overwrites_entire_tree() -> None:
     latents = torch.arange(12, dtype=torch.float32).view(1, 3, 4)
     levels = torch.tensor([[0, 1, 2]], dtype=torch.long)
     idxs = torch.tensor([[0, 0, 0]], dtype=torch.long)
-    flags = torch.full((1, 3), fill_value=int(WCTFlags.VIRTUAL), dtype=torch.long)
+    flags = torch.full((1, 3), fill_value=int(WCTFlags.MASKED), dtype=torch.long)
     lengths = torch.tensor([2], dtype=torch.long)
 
     wct.load_sequence(
@@ -167,5 +167,5 @@ def test_wct_load_sequence_overwrites_entire_tree() -> None:
     torch.testing.assert_close(lat[:, :2], latents[:, :2])
     torch.testing.assert_close(node_ids[0, :2, 0], levels[0, :2])
     torch.testing.assert_close(node_ids[0, :2, 1], idxs[0, :2])
-    assert torch.all(wct_flags[:, :2] == int(WCTFlags.VIRTUAL))
+    assert torch.all(wct_flags[:, :2] == int(WCTFlags.MASKED))
     assert wct_lengths.tolist() == [2]

@@ -31,9 +31,9 @@ class BaseContextManagerConfig:
 
 @dataclass
 class TrainingContextManagerConfig(BaseContextManagerConfig):
-    virtual_dropout_prob: float = 0.0
+    mask_dropout_probs: Optional[List[float]] = None
     holdout_tokens: int = 0
-    virtual_dropout_seed: Optional[int] = None
+    mask_dropout_seed: Optional[int] = None
 
 
 @dataclass
@@ -135,7 +135,7 @@ class BaseContextManager:
 
         - Always keep the last token nodes defined by `tail_token_keep`.
         - Always keep the last node per level (root summaries).
-        - Nodes already marked virtual are free to drop/compact.
+        - Nodes already marked masked are free to drop/compact.
         """
         B, max_len = node_ids.shape[:2]
         device = node_ids.device
@@ -161,9 +161,9 @@ class BaseContextManager:
         last_per_level = active & (~same_next)
         mask |= last_per_level
 
-        virtual_bit = int(WCTFlags.VIRTUAL)
-        virtual = (flags & virtual_bit) != 0
-        mask &= ~virtual
+        masked_bit = int(WCTFlags.MASKED)
+        masked = (flags & masked_bit) != 0
+        mask &= ~masked
         return mask
 
     def _allocate_mask(self, batch: int) -> torch.Tensor:
@@ -267,8 +267,8 @@ class TrainingContextManager(BaseContextManager):
         super().__init__(config, device=device, dtype=dtype)
         self.config = config
         seed = (
-            config.virtual_dropout_seed
-            if config.virtual_dropout_seed is not None
+            config.mask_dropout_seed
+            if config.mask_dropout_seed is not None
             else config.focus_seed
         )
         self._dropout_generator = torch.Generator(device="cpu")
@@ -306,9 +306,18 @@ class TrainingContextManager(BaseContextManager):
 
         latents, node_ids, flags, lengths = self.wct.tensors()
         holdout_mask = self._build_holdout_mask(node_ids, lengths)
-        virtual_mask = self._build_virtual_mask(node_ids, lengths, holdout_mask)
-        if torch.any(virtual_mask):
-            self.wct.mark_virtual(virtual_mask)
+        level_counts = [
+            self.mct.level_latents(level).shape[1] for level in range(self.mct.num_levels())
+        ]
+        masked_mask = self._build_masked_dropout_mask(
+            node_ids=node_ids,
+            lengths=lengths,
+            holdout_mask=holdout_mask,
+            level_counts=level_counts,
+            block_size=self.gistnet.block_size,
+        )
+        if torch.any(masked_mask):
+            self.wct.mark_masked(masked_mask)
             # Refresh tensors to expose updated flags
             latents, node_ids, flags, lengths = self.wct.tensors()
 
@@ -317,44 +326,157 @@ class TrainingContextManager(BaseContextManager):
             "node_ids": node_ids,
             "flags": flags,
             "lengths": lengths,
-            "virtual_mask": virtual_mask,
+            "masked_mask": masked_mask,
             "holdout_mask": holdout_mask,
         }
 
-    def _build_virtual_mask(
+    def _build_masked_dropout_mask(
         self,
-        node_ids: torch.Tensor,
-        lengths: torch.Tensor,
-        holdout_mask: torch.Tensor,
+        *,
+        node_ids: torch.Tensor,  # [B, max_len, 2]
+        lengths: torch.Tensor,  # [B]
+        holdout_mask: torch.Tensor,  # [B, max_nodes]
+        level_counts: List[int],
+        block_size: int,
     ) -> torch.Tensor:
+        """
+        Build the deterministic masked-dropout mask for training-time sparsification.
+
+        This implements the "fully-masked" regime: nodes are never physically removed.
+        Instead we set `WCTFlags.MASKED` on selected nodes so downstream code can mask
+        them out without changing tensor shapes.
+
+        Policy (current POC):
+        - Nodes at every level may be masked, except the highest level which stays dense.
+        - Never drop nodes in the must-keep set (tail tokens + last-per-level).
+        - Never drop nodes in the holdout set (used as next-gist ground truth).
+
+        Args:
+            node_ids: `[B, max_len, 2]` `(level, node_index)` metadata.
+            lengths: `[B]` active lengths.
+            holdout_mask: `[B, max_nodes]` or `[B, max_len]` boolean mask; True = holdout.
+        Returns:
+            mask: `[B, max_nodes]` boolean mask; True entries are marked masked.
+        """
         if self.wct.batch_size is None:
             raise RuntimeError("WorkingContextTree has no nodes to mask.")
-        mask = self._allocate_mask(self.wct.batch_size)
-        if self.config.virtual_dropout_prob <= 0:
+        if block_size <= 0:
+            raise ValueError("block_size must be positive.")
+        mask = self._allocate_mask(self.wct.batch_size)  # [B, max_nodes]
+        if not level_counts:
             return mask
+        num_levels = len(level_counts)
+        if num_levels <= 1:
+            return mask
+        probs = self.config.mask_dropout_probs
+        if probs is None:
+            raise ValueError(
+                "mask_dropout_probs must be provided to control per-level sparsity."
+            )
+        if len(probs) < num_levels:
+            raise ValueError(
+                "mask_dropout_probs must provide one probability per populated LOD."
+            )
+        probs = probs[:num_levels]
+        # Highest level has no parents; keep it dense.
+        probs = list(probs)
+        probs[-1] = 0.0
 
         _, _, flags, _ = self.wct.tensors()
-        guard = self._must_keep_mask(node_ids, flags, lengths)
-        holdout_active = holdout_mask[:, : node_ids.shape[1]]
-        guard[:, : holdout_active.shape[1]] |= holdout_active
-
+        guard_slots = self._must_keep_mask(node_ids, flags, lengths)  # [B, max_len]
         max_len = node_ids.shape[1]
-        active = (
-            torch.arange(max_len, device=node_ids.device)
-            .unsqueeze(0)
-            .expand(self.wct.batch_size, -1)
-        ) < lengths.unsqueeze(1)
-        tokens = (node_ids[..., 0] == 0) & active
-        eligible = tokens & (~guard[:, :max_len]) & (~holdout_active)
-        if not torch.any(eligible):
-            return mask
+        holdout_slots = holdout_mask[:, :max_len].to(torch.bool)  # [B, max_len]
+        guard_slots |= holdout_slots
 
-        rand = torch.rand(
-            eligible.shape,
-            generator=self._dropout_generator,
-        ).to(eligible.device)
-        drop = (rand < float(self.config.virtual_dropout_prob)) & eligible
-        mask[:, :max_len] = drop
+        B = self.wct.batch_size
+        device = node_ids.device
+        active_slots = (
+            torch.arange(max_len, device=device).unsqueeze(0).expand(B, -1)
+        ) < lengths.unsqueeze(1)  # [B, max_len]
+
+        # Build per-level forced-keep masks in (level, node_index) space.
+        forced_keep: List[torch.Tensor] = []
+        for level, count in enumerate(level_counts):
+            keep = torch.zeros(B, count, dtype=torch.bool, device=device)
+            keep[:, -1] = True  # last node per level
+            forced_keep.append(keep)
+
+        # Force keep tail LOD0 tokens and holdout LOD0 tokens.
+        if level_counts[0] > 0:
+            token_count = level_counts[0]
+            # Tail tokens
+            tail_k = int(self.config.tail_token_keep)
+            if tail_k > 0:
+                tail_k = min(tail_k, token_count)
+                forced_keep[0][:, token_count - tail_k : token_count] = True
+            # Holdout tokens (also last K tokens, by current holdout policy)
+            holdout_k = int(self.config.holdout_tokens)
+            if holdout_k > 0:
+                holdout_k = min(holdout_k, token_count)
+                forced_keep[0][:, token_count - holdout_k : token_count] = True
+
+        # Propagate forced keeps upward so ancestors of must-keep nodes remain.
+        for level in range(0, num_levels - 1):
+            child_count = level_counts[level]
+            parent_count = level_counts[level + 1]
+            if child_count == 0 or parent_count == 0:
+                continue
+            parent_idx = torch.arange(child_count, device=device) // block_size  # [C]
+            valid = parent_idx < parent_count
+            if not torch.any(valid):
+                continue
+            parent_idx_safe = torch.where(
+                valid, parent_idx, torch.zeros_like(parent_idx)
+            )  # [C]
+            parent_idx_b = parent_idx_safe.unsqueeze(0).expand(B, -1)  # [B,C]
+            child_keep_long = (forced_keep[level].to(torch.long)) * valid.to(torch.long)
+            parent_keep_long = torch.zeros(B, parent_count, dtype=torch.long, device=device)
+            parent_keep_long.scatter_add_(1, parent_idx_b, child_keep_long)
+            forced_keep[level + 1] |= parent_keep_long > 0
+
+        # Sample drops top-down, forcing child drops when parent is dropped.
+        keep_masks: List[torch.Tensor] = [torch.ones_like(k) for k in forced_keep]
+        keep_masks[-1] = torch.ones_like(forced_keep[-1])  # top level dense
+        for level in range(num_levels - 2, -1, -1):
+            count = level_counts[level]
+            if count == 0:
+                keep_masks[level] = torch.zeros_like(forced_keep[level])
+                continue
+            parent_count = level_counts[level + 1]
+            parent_keep = keep_masks[level + 1]  # [B, P]
+            parent_idx = torch.arange(count, device=device) // block_size  # [C]
+            valid = parent_idx < parent_count  # [C]
+            parent_idx_safe = torch.where(
+                valid, parent_idx, torch.zeros_like(parent_idx)
+            )  # [C]
+            parent_idx_b = parent_idx_safe.unsqueeze(0).expand(B, -1)  # [B,C]
+            parent_dropped = torch.zeros(B, count, dtype=torch.bool, device=device)
+            if parent_count > 0 and torch.any(valid):
+                parent_dropped = (~parent_keep.gather(1, parent_idx_b)) & valid.unsqueeze(
+                    0
+                )
+            rand = torch.rand((B, count), generator=self._dropout_generator).to(device)
+            drop = (rand < float(probs[level])) & (~forced_keep[level])
+            keep_masks[level] = forced_keep[level] | (~drop & ~parent_dropped)
+
+        # Convert per-level keep masks into slot mask.
+        offset = 0
+        for level, count in enumerate(level_counts):
+            if count == 0:
+                continue
+            seg = slice(offset, offset + count)
+            # Only drop active slots; ignore padding.
+            drop_slots = (~keep_masks[level]) & active_slots[:, seg] & (~guard_slots[:, seg])
+            mask[:, seg] = drop_slots
+            offset += count
+
+        return mask
+
+        rand = torch.rand(eligible.shape, generator=self._dropout_generator).to(
+            eligible.device
+        )  # [B, max_len]
+        drop = (rand < float(self.config.mask_dropout_prob)) & eligible  # [B, max_len]
+        mask[:, :max_len] = drop  # [B, max_nodes]
         return mask
 
     def _build_holdout_mask(
@@ -362,9 +484,22 @@ class TrainingContextManager(BaseContextManager):
         node_ids: torch.Tensor,
         lengths: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        Build the deterministic holdout mask for training.
+
+        Holdout nodes remain active (never masked) and are reserved to
+        serve as next-gist ground truth targets. For now, we hold out the last K
+        LOD0 token nodes.
+
+        Args:
+            node_ids: `[B, max_len, 2]` `(level, node_index)` metadata.
+            lengths: `[B]` active lengths.
+        Returns:
+            mask: `[B, max_nodes]` boolean mask; True entries are holdout nodes.
+        """
         if self.wct.batch_size is None:
             raise RuntimeError("WorkingContextTree has no nodes to mask.")
-        mask = self._allocate_mask(self.wct.batch_size)
+        mask = self._allocate_mask(self.wct.batch_size)  # [B, max_nodes]
         if self.config.holdout_tokens <= 0:
             return mask
         max_len = node_ids.shape[1]
@@ -372,11 +507,11 @@ class TrainingContextManager(BaseContextManager):
             torch.arange(max_len, device=node_ids.device)
             .unsqueeze(0)
             .expand(self.wct.batch_size, -1)
-        ) < lengths.unsqueeze(1)
-        tokens = (node_ids[..., 0] == 0) & active
-        rev_cumsum = torch.cumsum(tokens.flip(-1), dim=-1).flip(-1)
-        keep = tokens & (rev_cumsum <= self.config.holdout_tokens)
-        mask[:, :max_len] = keep
+        ) < lengths.unsqueeze(1)  # [B, max_len]
+        tokens = (node_ids[..., 0] == 0) & active  # [B, max_len]
+        rev_cumsum = torch.cumsum(tokens.flip(-1), dim=-1).flip(-1)  # [B, max_len]
+        keep = tokens & (rev_cumsum <= self.config.holdout_tokens)  # [B, max_len]
+        mask[:, :max_len] = keep  # [B, max_nodes]
         return mask
 
 
@@ -513,13 +648,13 @@ class InferenceContextManager(BaseContextManager):
         shrink = max(0, self.config.target_node_shrink)
         upper = target + growth
         lower = max(0, target - shrink)
-        virtual_bit = int(WCTFlags.VIRTUAL)
+        masked_bit = int(WCTFlags.MASKED)
 
         B, max_len = node_ids.shape[:2]
         active = (
             torch.arange(max_len, device=device).unsqueeze(0).expand(B, -1)
         ) < lengths.unsqueeze(1)
-        live_mask = active & ((flags[:, :max_len] & virtual_bit) == 0)
+        live_mask = active & ((flags[:, :max_len] & masked_bit) == 0)
         live_count = live_mask.sum(dim=1)
 
         if force:
@@ -561,7 +696,7 @@ class InferenceContextManager(BaseContextManager):
 
         mask[:, :max_len] = drop_mask
         if torch.any(drop_mask):
-            self.wct.mark_virtual(mask)
+            self.wct.mark_masked(mask)
             for b in range(batch):
                 indices = torch.nonzero(drop_mask[b], as_tuple=False).flatten()
                 if indices.numel() == 0:
